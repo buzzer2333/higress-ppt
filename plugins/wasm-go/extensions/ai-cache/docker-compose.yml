@@ -1,0 +1,16 @@
+version: '3.9'
+services:
+  higress:
+      #这个镜像包含redis，并且包含了ai-proxy插件
+    image: registry.cn-hangzhou.aliyuncs.com/ztygw/aio-redis:1.4.0-rc.1
+    environment:
+        #开启日志输出
+      - GATEWAY_COMPONENT_LOG_LEVEL=misc:error,wasm:debug
+    ports:
+      #管理页面端口
+      - "8080:8080/tcp"
+        #llm端口
+      - "8001:8001/tcp"
+      #redis端口
+      - "6379:6379/tcp"
+    restart: always
