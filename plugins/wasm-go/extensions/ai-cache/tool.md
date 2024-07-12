@@ -7,8 +7,10 @@ tinygo build -o main.wasm -scheduler=none -target=wasi -gc=custom -tags="customm
 
 ## 镜像
 docker login --username=小学生反弹 registry.cn-shanghai.aliyuncs.com
+docker login --username=619457703@qq.com registry.cn-shanghai.aliyuncs.com
 
 docker buildx build --platform linux/amd64 -t registry.cn-hangzhou.aliyuncs.com/ai-cache/wasm:v1.0 . --push
+docker buildx build --platform linux/amd64 -t registry.cn-shanghai.aliyuncs.com/yang_666/wasm:v1.0 . --push
 
 
 ## higress 平台配置 镜像地址
