@@ -116,8 +116,22 @@ type PluginConfig struct {
 	CacheTTL int `required:"false" yaml:"cacheTTL" json:"cacheTTL"`
 	// @Title zh-CN Redis缓存Key的前缀
 	// @Description zh-CN 默认值是"higress-ai-cache:"
-	CacheKeyPrefix string              `required:"false" yaml:"cacheKeyPrefix" json:"cacheKeyPrefix"`
-	redisClient    wrapper.RedisClient `yaml:"-" json:"-"`
+	CacheKeyPrefix   string              `required:"false" yaml:"cacheKeyPrefix" json:"cacheKeyPrefix"`
+	redisClient      wrapper.RedisClient `yaml:"-" json:"-"`
+	DashVectorClient wrapper.HttpClient  `yaml:"-" json:"-"`
+	DashScopeClient  wrapper.HttpClient  `yaml:"-" json:"-"`
+	DashVectorInfo   DashVectorInfo      `required:"true" yaml:"dashvector" json:"dashvector"`
+}
+
+type DashVectorInfo struct {
+	DashScopeServiceName  string             `require:"true" yaml:"DashScopeServiceName" jaon:"DashScopeServiceName"`
+	DashScopeKey          string             `require:"true" yaml:"DashScopeKey" jaon:"DashScopeKey"`
+	DashVectorServiceName string             `require:"true" yaml:"DashVectorServiceName" jaon:"DashVectorServiceName"`
+	DashVectorKey         string             `require:"true" yaml:"DashVectorKey" jaon:"DashVectorKey"`
+	DashVectorAuthApiEnd  string             `require:"true" yaml:"DashVectorEnd" jaon:"DashVectorEnd"`
+	DashVectorCollection  string             `require:"true" yaml:"DashVectorCollection" jaon:"DashVectorCollection"`
+	DashVectorClient      wrapper.HttpClient `yaml:"-" json:"-"`
+	DashScopeClient       wrapper.HttpClient `yaml:"-" json:"-"`
 }
 
 func parseConfig(json gjson.Result, c *PluginConfig, log wrapper.Log) error {
@@ -174,6 +188,25 @@ func parseConfig(json gjson.Result, c *PluginConfig, log wrapper.Log) error {
 		log.Errorf("init redis client failed, err:%v", err)
 	}
 	log.Infof("init redis client success")
+
+	// http client
+	c.DashVectorInfo.DashScopeKey = json.Get("dashvector.DashScopeKey").String()
+	c.DashVectorInfo.DashScopeServiceName = json.Get("dashvector.DashScopeServiceName").String()
+	c.DashVectorInfo.DashVectorServiceName = json.Get("dashvector.DashVectorServiceName").String()
+	c.DashVectorInfo.DashVectorKey = json.Get("dashvector.DashVectorKey").String()
+	c.DashVectorInfo.DashVectorAuthApiEnd = json.Get("dashvector.DashVectorEnd").String()
+	c.DashVectorInfo.DashVectorCollection = json.Get("dashvector.DashVectorCollection").String()
+
+	c.DashVectorClient = wrapper.NewClusterClient(wrapper.DnsCluster{
+		ServiceName: c.DashVectorInfo.DashVectorServiceName,
+		Port:        443,
+		Domain:      c.DashVectorInfo.DashVectorAuthApiEnd,
+	})
+	c.DashScopeClient = wrapper.NewClusterClient(wrapper.DnsCluster{
+		ServiceName: c.DashVectorInfo.DashScopeServiceName,
+		Port:        443,
+		Domain:      "dashscope.aliyuncs.com",
+	})
 	return nil
 }
 
@@ -198,6 +231,95 @@ func TrimQuote(source string) string {
 	return strings.Trim(source, `"`)
 }
 
+// func getUUID() string {
+// 	// 使用当前时间戳和随机数生成唯一键
+// 	// timestamp := time.Now().UnixNano()
+// 	// randNum := rand.Intn(1000000)
+// 	// uniqueKey := fmt.Sprintf("%d%d", timestamp, randNum)
+// 	return uniqueKey
+// }
+
+// 先查redis，再查近似回答
+func getCacheWithSimilarQuery(config PluginConfig, ctx wrapper.HttpContext, key string, stream bool, log wrapper.Log) error {
+	err := config.redisClient.Get(config.CacheKeyPrefix+key, func(response resp.Value) {
+		if err := response.Error(); err != nil {
+			log.Errorf("redis get key:%s failed, err:%v", key, err)
+			proxywasm.ResumeHttpRequest()
+			return
+		}
+		if response.IsNull() {
+			log.Debugf("cache miss, getCacheWithSimilarQuery:%s", key)
+			// TODO 计算向量距离，看下是否有近似回答
+			// 1. embedding
+			textEmbeddings, err := GenerateEmbeddings([]string{key})
+			if err != nil {
+				log.Errorf("[embedding] error : %s", err)
+			}
+			// 1.1 写入 向量数据库
+			fields := make(map[string]string, 0)
+			fields["title"] = key
+			id := key[0:10]
+			_, insertErr := InsertVector(id, textEmbeddings, fields)
+			log.Infof("InsertVector, id: %s, key: %s, insertErr: %v", id, key, insertErr)
+			// 2. 查距离 小于 0.1 的key
+			reqBody := QueryRequest{
+
+				Vector:        textEmbeddings,
+				Topk:          1,
+				IncludeVector: false,
+			}
+			queryResp, queryErr := QueryCollection(reqBody)
+			if queryErr != nil {
+				log.Errorf("[QueryCollection] error : %s", err)
+			}
+			if len(queryResp.Output) > 0 {
+				topOne := queryResp.Output[0]
+				score := topOne.Score
+				if score <= 0.1 {
+					similarQuery := topOne.Fields["title"]
+					getCacheKey(config, ctx, fmt.Sprintf("%s", similarQuery), stream, log)
+				}
+			} else {
+				proxywasm.ResumeHttpRequest()
+			}
+
+			return
+		}
+		log.Debugf("cache hit, getCacheWithSimilarQuery:%s", key)
+		ctx.SetContext(CacheKeyContextKey, nil)
+		if !stream {
+			proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, response.String())), -1)
+		} else {
+			proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnStreamResponseTemplate, response.String())), -1)
+		}
+	})
+	return err
+}
+
+// 只从redis获取
+func getCacheKey(config PluginConfig, ctx wrapper.HttpContext, key string, stream bool, log wrapper.Log) error {
+	err := config.redisClient.Get(config.CacheKeyPrefix+key, func(response resp.Value) {
+		if err := response.Error(); err != nil {
+			log.Errorf("redis get key:%s failed, err:%v", key, err)
+			proxywasm.ResumeHttpRequest()
+			return
+		}
+		if response.IsNull() {
+			log.Debugf("cache miss, key:%s", key)
+			proxywasm.ResumeHttpRequest()
+			return
+		}
+		log.Debugf("cache hit, getCacheKey:%s", key)
+		ctx.SetContext(CacheKeyContextKey, nil)
+		if !stream {
+			proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, response.String())), -1)
+		} else {
+			proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnStreamResponseTemplate, response.String())), -1)
+		}
+	})
+	return err
+}
+
 func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte, log wrapper.Log) types.Action {
 	bodyJson := gjson.ParseBytes(body)
 	// TODO: It may be necessary to support stream mode determination for different LLM providers.
@@ -214,25 +336,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 		return types.ActionContinue
 	}
 	ctx.SetContext(CacheKeyContextKey, key)
-	err := config.redisClient.Get(config.CacheKeyPrefix+key, func(response resp.Value) {
-		if err := response.Error(); err != nil {
-			log.Errorf("redis get key:%s failed, err:%v", key, err)
-			proxywasm.ResumeHttpRequest()
-			return
-		}
-		if response.IsNull() {
-			log.Debugf("cache miss, key:%s", key)
-			proxywasm.ResumeHttpRequest()
-			return
-		}
-		log.Debugf("cache hit, key:%s", key)
-		ctx.SetContext(CacheKeyContextKey, nil)
-		if !stream {
-			proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, response.String())), -1)
-		} else {
-			proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnStreamResponseTemplate, response.String())), -1)
-		}
-	})
+	err := getCacheWithSimilarQuery(config, ctx, key, stream, log)
 	if err != nil {
 		log.Error("redis access failed")
 		return types.ActionContinue

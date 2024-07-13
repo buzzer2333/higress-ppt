@@ -20,7 +20,7 @@ type EmbeddingResponse struct {
 }
 
 // Function to generate embeddings
-func GenerateEmbeddings(texts []string) (*EmbeddingResponse, error) {
+func GenerateEmbeddings(texts []string) ([]float64, error) {
 	apiKey := "sk-f7850ccc740a4cbfb88a0b2e80d6d600"
 	// Construct the request body
 	requestBody := map[string]interface{}{
@@ -69,8 +69,8 @@ func GenerateEmbeddings(texts []string) (*EmbeddingResponse, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error unmarshaling response: %w", err)
 	}
-
-	return &output, nil
+	em := output.Output.Embeddings[0].Embedding
+	return em, nil
 }
 
 // 定义一个结构体来匹配请求体的格式

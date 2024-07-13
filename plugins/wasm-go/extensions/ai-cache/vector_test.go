@@ -27,8 +27,8 @@ func TestInsertVector(t *testing.T) {
 	fields["title"] = title
 
 	// Generate embeddings
-	output, _ := GenerateEmbeddings(texts)
-	text_embedding := output.Output.Embeddings[0].Embedding
+	text_embedding, _ := GenerateEmbeddings(texts)
+	// text_embedding := output.Output.Embeddings[0].Embedding
 	id := "1"
 	InsertVector(id, text_embedding, fields)
 }
@@ -43,8 +43,8 @@ func TestQueryCollection(t *testing.T) {
 	fields["title"] = title
 
 	// Generate embeddings
-	output, _ := GenerateEmbeddings(texts)
-	text_embedding := output.Output.Embeddings[0].Embedding
+	text_embedding, _ := GenerateEmbeddings(texts)
+	// text_embedding := output.Output.Embeddings[0].Embedding
 	// id := "1"
 	// InsertVector(id, text_embedding, fields)
 
