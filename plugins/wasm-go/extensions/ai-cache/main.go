@@ -4,8 +4,10 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/wrapper"
@@ -120,19 +122,19 @@ type PluginConfig struct {
 	redisClient      wrapper.RedisClient `yaml:"-" json:"-"`
 	DashVectorClient wrapper.HttpClient  `yaml:"-" json:"-"`
 	DashScopeClient  wrapper.HttpClient  `yaml:"-" json:"-"`
-	DashVectorInfo   DashVectorInfo      `required:"true" yaml:"dashvector" json:"dashvector"`
+	// DashVectorInfo   DashVectorInfo      `required:"true" yaml:"dashvector" json:"dashvector"`
 }
 
-type DashVectorInfo struct {
-	DashScopeServiceName  string             `require:"true" yaml:"DashScopeServiceName" jaon:"DashScopeServiceName"`
-	DashScopeKey          string             `require:"true" yaml:"DashScopeKey" jaon:"DashScopeKey"`
-	DashVectorServiceName string             `require:"true" yaml:"DashVectorServiceName" jaon:"DashVectorServiceName"`
-	DashVectorKey         string             `require:"true" yaml:"DashVectorKey" jaon:"DashVectorKey"`
-	DashVectorAuthApiEnd  string             `require:"true" yaml:"DashVectorEnd" jaon:"DashVectorEnd"`
-	DashVectorCollection  string             `require:"true" yaml:"DashVectorCollection" jaon:"DashVectorCollection"`
-	DashVectorClient      wrapper.HttpClient `yaml:"-" json:"-"`
-	DashScopeClient       wrapper.HttpClient `yaml:"-" json:"-"`
-}
+// type DashVectorInfo struct {
+// 	DashScopeServiceName  string             `require:"true" yaml:"DashScopeServiceName" jaon:"DashScopeServiceName"`
+// 	DashScopeKey          string             `require:"true" yaml:"DashScopeKey" jaon:"DashScopeKey"`
+// 	DashVectorServiceName string             `require:"true" yaml:"DashVectorServiceName" jaon:"DashVectorServiceName"`
+// 	DashVectorKey         string             `require:"true" yaml:"DashVectorKey" jaon:"DashVectorKey"`
+// 	DashVectorAuthApiEnd  string             `require:"true" yaml:"DashVectorEnd" jaon:"DashVectorEnd"`
+// 	DashVectorCollection  string             `require:"true" yaml:"DashVectorCollection" jaon:"DashVectorCollection"`
+// 	DashVectorClient      wrapper.HttpClient `yaml:"-" json:"-"`
+// 	DashScopeClient       wrapper.HttpClient `yaml:"-" json:"-"`
+// }
 
 func parseConfig(json gjson.Result, c *PluginConfig, log wrapper.Log) error {
 	c.RedisInfo.ServiceName = json.Get("redis.serviceName").String()
@@ -190,23 +192,25 @@ func parseConfig(json gjson.Result, c *PluginConfig, log wrapper.Log) error {
 	log.Infof("init redis client success")
 
 	// http client
-	c.DashVectorInfo.DashScopeKey = json.Get("dashvector.DashScopeKey").String()
-	c.DashVectorInfo.DashScopeServiceName = json.Get("dashvector.DashScopeServiceName").String()
-	c.DashVectorInfo.DashVectorServiceName = json.Get("dashvector.DashVectorServiceName").String()
-	c.DashVectorInfo.DashVectorKey = json.Get("dashvector.DashVectorKey").String()
-	c.DashVectorInfo.DashVectorAuthApiEnd = json.Get("dashvector.DashVectorEnd").String()
-	c.DashVectorInfo.DashVectorCollection = json.Get("dashvector.DashVectorCollection").String()
+	// c.DashVectorInfo.DashScopeKey = json.Get("dashvector.DashScopeKey").String()
+	// c.DashVectorInfo.DashScopeServiceName = json.Get("dashvector.DashScopeServiceName").String()
+	// c.DashVectorInfo.DashVectorServiceName = json.Get("dashvector.DashVectorServiceName").String()
+	// c.DashVectorInfo.DashVectorKey = json.Get("dashvector.DashVectorKey").String()
+	// c.DashVectorInfo.DashVectorAuthApiEnd = json.Get("dashvector.DashVectorEnd").String()
+	// c.DashVectorInfo.DashVectorCollection = json.Get("dashvector.DashVectorCollection").String()
 
 	c.DashVectorClient = wrapper.NewClusterClient(wrapper.DnsCluster{
-		ServiceName: c.DashVectorInfo.DashVectorServiceName,
+		ServiceName: "DashVector",
 		Port:        443,
-		Domain:      c.DashVectorInfo.DashVectorAuthApiEnd,
+		Domain:      "vrs-cn-0mm3tnahd00022.dashvector.cn-hangzhou.aliyuncs.com",
 	})
 	c.DashScopeClient = wrapper.NewClusterClient(wrapper.DnsCluster{
-		ServiceName: c.DashVectorInfo.DashScopeServiceName,
+		ServiceName: "dns",
 		Port:        443,
 		Domain:      "dashscope.aliyuncs.com",
 	})
+
+	// log.Info("[ccccc]" + fmt.Sprintf("%+v", c))
 	return nil
 }
 
@@ -231,13 +235,157 @@ func TrimQuote(source string) string {
 	return strings.Trim(source, `"`)
 }
 
-// func getUUID() string {
-// 	// 使用当前时间戳和随机数生成唯一键
-// 	// timestamp := time.Now().UnixNano()
-// 	// randNum := rand.Intn(1000000)
-// 	// uniqueKey := fmt.Sprintf("%d%d", timestamp, randNum)
-// 	return uniqueKey
-// }
+func GetCacheRes(ctx wrapper.HttpContext, config PluginConfig, log wrapper.Log, key string, stream bool, needVector bool) error {
+	err := config.redisClient.Get(config.CacheKeyPrefix+key, func(response resp.Value) {
+		if err := response.Error(); err == nil && !response.IsNull() {
+			log.Warnf("cache hit, key:%s", key)
+			ctx.SetContext(CacheKeyContextKey, nil)
+			if !stream {
+				proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, response.String())), -1)
+			} else {
+				proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnStreamResponseTemplate, response.String())), -1)
+			}
+		} else {
+			log.Warnf("cache miss, key:%s", key)
+			if needVector {
+				GetEmbeddingsCache(ctx, config, log, key, stream)
+			} else {
+				proxywasm.ResumeHttpRequest()
+				return
+			}
+		}
+	})
+	return err
+}
+
+func GetEmbeddingsCache(ctx wrapper.HttpContext, config PluginConfig, log wrapper.Log, queryString string, stream bool) {
+	// param generate
+	apiToken := "sk-f7850ccc740a4cbfb88a0b2e80d6d600"
+	texts := []string{queryString}
+	Emb_url := "/api/v1/services/embeddings/text-embedding/text-embedding"
+	Emb_headers := [][2]string{
+		{"Authorization", "Bearer " + apiToken},
+		{"Content-Type", "application/json"},
+	}
+	requestBody := map[string]interface{}{
+		"model": "text-embedding-v1",
+		"input": map[string][]string{
+			"texts": texts,
+		},
+		"parameters": map[string]string{
+			"text_type": "query",
+		},
+	}
+	jsonData, _ := json.Marshal(requestBody)
+	Emb_requestBody := jsonData
+
+	// call
+	config.DashScopeClient.Post(
+		Emb_url,
+		Emb_headers,
+		Emb_requestBody,
+		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+			log.Infof("Successfully fetched embeddings for key: %s", queryString)
+			if statusCode != 200 {
+				log.Errorf("Failed to fetch embeddings, statusCode: %d, responseBody: %s, request: %s", statusCode, string(responseBody), string(jsonData))
+				ctx.SetContext(queryString, nil)
+				proxywasm.ResumeHttpRequest()
+			} else {
+				processFetchedEmbeddings(queryString, responseBody, ctx, config, log, stream)
+			}
+		},
+		10000)
+}
+
+// 相似查询
+func processFetchedEmbeddings(key string, responseBody []byte, ctx wrapper.HttpContext, config PluginConfig, log wrapper.Log, stream bool) {
+	var resp EmbeddingResponse
+	_ = json.Unmarshal(responseBody, &resp)
+
+	textEmbeddings := resp.Output.Embeddings[0].Embedding
+	url := "/v1/collections/ai_query/query"
+	header := [][2]string{
+		{"Content-Type", "application/json"},
+		{"dashvector-auth-token", "sk-fT4ZBgf5pg02KG2b5paBmHviIthA1EECFADAF3F8611EF93DD762CA87E1E4C"},
+	}
+	reqBody := QueryRequest{
+		Vector:        textEmbeddings,
+		Topk:          1,
+		IncludeVector: false,
+	}
+	jsonData, _ := json.Marshal(reqBody)
+	config.DashVectorClient.Post(
+		url,
+		header,
+		jsonData,
+		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+			log.Infof("post processFetchedEmbeddings statusCode:%d, responseBody:%s, req: %s", statusCode, string(responseBody), string(jsonData))
+			if statusCode != 200 {
+				log.Errorf("Failed processFetchedEmbeddings, statusCode: %d, responseBody: %s", statusCode, string(responseBody))
+				proxywasm.ResumeHttpRequest()
+			} else {
+				log.Infof("Success processFetchedEmbeddings, response: %s", string(responseBody))
+				var response QueryResponse
+				_ = json.Unmarshal(responseBody, &response)
+				if len(response.Output) < 1 {
+					log.Warnf("similar response is empty")
+					InsertEmbedding(ctx, config, log, key, textEmbeddings)
+					return
+				}
+				similarKey := response.Output[0].Fields["title"].(string)
+				log.Infof("origin key: %s, similar key:%s", key, similarKey)
+				score := response.Output[0].Score
+				if score < 0.1 {
+					GetCacheRes(ctx, config, log, key, stream, false)
+				} else {
+					InsertEmbedding(ctx, config, log, key, textEmbeddings)
+					proxywasm.ResumeHttpRequest()
+					return
+				}
+			}
+
+		},
+		10000)
+}
+
+// 更新 向量数据库
+func InsertEmbedding(ctx wrapper.HttpContext, config PluginConfig, log wrapper.Log, key string, vector []float64) error {
+	url := "/v1/collections/ai_query/docs"
+	header := [][2]string{
+		{"Content-Type", "application/json"},
+		{"dashvector-auth-token", "sk-fT4ZBgf5pg02KG2b5paBmHviIthA1EECFADAF3F8611EF93DD762CA87E1E4C"},
+	}
+	fields := make(map[string]string, 0)
+	fields["title"] = key
+
+	// id := key[0:10]
+	doc := &Doc{
+		// Id:     ctx,
+		Vector: vector,
+		Fields: fields,
+	}
+	// 构造请求体
+	requestBody := VectorRequest{
+		Docs: []Doc{*doc},
+	}
+	// 将请求体转换为 JSON 字节
+	jsonData, _ := json.Marshal(requestBody)
+	config.DashVectorClient.Post(
+		url,
+		header,
+		jsonData,
+		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+			if statusCode != 200 {
+				log.Errorf("Failed to upload query embedding: %s", responseBody)
+			} else {
+				log.Infof("Successfully uploaded query embedding for key: %s", key)
+			}
+			proxywasm.ResumeHttpRequest()
+		},
+		10000,
+	)
+	return nil
+}
 
 // 先查redis，再查近似回答
 func getCacheWithSimilarQuery(config PluginConfig, ctx wrapper.HttpContext, key string, stream bool, log wrapper.Log) error {
@@ -336,7 +484,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 		return types.ActionContinue
 	}
 	ctx.SetContext(CacheKeyContextKey, key)
-	err := getCacheWithSimilarQuery(config, ctx, key, stream, log)
+	err := GetCacheRes(ctx, config, log, key, stream, true)
 	if err != nil {
 		log.Error("redis access failed")
 		return types.ActionContinue
